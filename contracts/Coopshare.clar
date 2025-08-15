@@ -17,6 +17,15 @@
 (define-constant ERR_ALREADY_STAKED (err u115))
 (define-constant ERR_EARLY_WITHDRAWAL (err u116))
 (define-constant ERR_REWARD_POOL_EMPTY (err u117))
+(define-constant ERR_FEATURE_NOT_FOUND (err u118))
+(define-constant ERR_ALREADY_BIDDING (err u119))
+(define-constant ERR_BID_NOT_FOUND (err u120))
+(define-constant ERR_FEATURE_COMPLETED (err u121))
+(define-constant ERR_NOT_FEATURE_OWNER (err u122))
+(define-constant ERR_NOT_BID_OWNER (err u123))
+(define-constant ERR_INSUFFICIENT_BOUNTY (err u124))
+(define-constant ERR_FEATURE_ACTIVE (err u125))
+(define-constant ERR_NO_BIDS (err u126))
 
 (define-data-var total-shares uint u0)
 (define-data-var total-members uint u0)
@@ -30,6 +39,8 @@
 (define-data-var min-stake-duration uint u144)
 (define-data-var max-stake-duration uint u52560)
 (define-data-var early-withdrawal-penalty uint u10)
+(define-data-var feature-counter uint u0)
+(define-data-var bid-counter uint u0)
 
 (define-map members principal {
     shares: uint,
@@ -65,6 +76,33 @@
 (define-map user-stakes principal (list 50 uint))
 
 (define-map stake-rewards principal uint)
+
+(define-map feature-requests uint {
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    bounty: uint,
+    requester: principal,
+    assignee: (optional principal),
+    created-at: uint,
+    deadline: uint,
+    status: (string-ascii 20),
+    category: (string-ascii 50),
+    priority: uint
+})
+
+(define-map feature-bids uint {
+    feature-id: uint,
+    bidder: principal,
+    amount: uint,
+    timeline: uint,
+    proposal: (string-ascii 300),
+    created-at: uint,
+    status: (string-ascii 20)
+})
+
+(define-map feature-bidders {feature-id: uint, bidder: principal} uint)
+(define-map user-feature-bids principal (list 100 uint))
+(define-map feature-bid-list uint (list 50 uint))
 
 (define-public (join-coop (initial-shares uint))
     (let (
@@ -382,6 +420,192 @@
     )
 )
 
+;; Feature Marketplace Functions
+
+(define-public (create-feature-request (title (string-ascii 100)) (description (string-ascii 500)) (bounty uint) (category (string-ascii 50)) (priority uint) (deadline-blocks uint))
+    (let (
+        (caller tx-sender)
+        (member-data (unwrap! (map-get? members caller) ERR_NOT_MEMBER))
+        (feature-id (+ (var-get feature-counter) u1))
+        (current-block stacks-block-height)
+        (deadline-block (+ current-block deadline-blocks))
+    )
+    (asserts! (> bounty u0) ERR_INVALID_AMOUNT)
+    (asserts! (> priority u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= priority u5) ERR_INVALID_AMOUNT)
+    (asserts! (>= (stx-get-balance caller) bounty) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? bounty caller (as-contract tx-sender)))
+    
+    (map-set feature-requests feature-id {
+        title: title,
+        description: description,
+        bounty: bounty,
+        requester: caller,
+        assignee: none,
+        created-at: current-block,
+        deadline: deadline-block,
+        status: "open",
+        category: category,
+        priority: priority
+    })
+    
+    (map-set feature-bid-list feature-id (list))
+    (var-set feature-counter feature-id)
+    
+    (ok feature-id)
+    )
+)
+
+(define-public (submit-bid (feature-id uint) (bid-amount uint) (timeline-blocks uint) (proposal (string-ascii 300)))
+    (let (
+        (caller tx-sender)
+        (member-data (unwrap! (map-get? members caller) ERR_NOT_MEMBER))
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (bid-id (+ (var-get bid-counter) u1))
+        (current-block stacks-block-height)
+        (bidder-key {feature-id: feature-id, bidder: caller})
+        (current-bids (default-to (list) (map-get? user-feature-bids caller)))
+        (existing-feature-bids (default-to (list) (map-get? feature-bid-list feature-id)))
+    )
+    (asserts! (is-eq (get status feature-data) "open") ERR_FEATURE_COMPLETED)
+    (asserts! (> bid-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> timeline-blocks u0) ERR_INVALID_DURATION)
+    (asserts! (< current-block (get deadline feature-data)) ERR_VOTING_ENDED)
+    (asserts! (is-none (map-get? feature-bidders bidder-key)) ERR_ALREADY_BIDDING)
+    (asserts! (< (len current-bids) u100) ERR_ALREADY_BIDDING)
+    (asserts! (< (len existing-feature-bids) u50) ERR_ALREADY_BIDDING)
+    
+    (map-set feature-bids bid-id {
+        feature-id: feature-id,
+        bidder: caller,
+        amount: bid-amount,
+        timeline: timeline-blocks,
+        proposal: proposal,
+        created-at: current-block,
+        status: "pending"
+    })
+    
+    (map-set feature-bidders bidder-key bid-id)
+    (map-set user-feature-bids caller (unwrap! (as-max-len? (append current-bids bid-id) u100) ERR_ALREADY_BIDDING))
+    (map-set feature-bid-list feature-id (unwrap! (as-max-len? (append existing-feature-bids bid-id) u50) ERR_ALREADY_BIDDING))
+    
+    (var-set bid-counter bid-id)
+    
+    (ok bid-id)
+    )
+)
+
+(define-public (accept-bid (feature-id uint) (bid-id uint))
+    (let (
+        (caller tx-sender)
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (bid-data (unwrap! (map-get? feature-bids bid-id) ERR_BID_NOT_FOUND))
+        (requester (get requester feature-data))
+        (bidder (get bidder bid-data))
+        (current-block stacks-block-height)
+    )
+    (asserts! (is-eq caller requester) ERR_NOT_FEATURE_OWNER)
+    (asserts! (is-eq (get feature-id bid-data) feature-id) ERR_BID_NOT_FOUND)
+    (asserts! (is-eq (get status feature-data) "open") ERR_FEATURE_COMPLETED)
+    (asserts! (is-eq (get status bid-data) "pending") ERR_FEATURE_COMPLETED)
+    
+    (map-set feature-requests feature-id (merge feature-data {
+        assignee: (some bidder),
+        status: "assigned"
+    }))
+    
+    (map-set feature-bids bid-id (merge bid-data {
+        status: "accepted"
+    }))
+    
+    (ok true)
+    )
+)
+
+(define-public (complete-feature (feature-id uint))
+    (let (
+        (caller tx-sender)
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (assignee (unwrap! (get assignee feature-data) ERR_NOT_BID_OWNER))
+        (bounty-amount (get bounty feature-data))
+        (current-block stacks-block-height)
+    )
+    (asserts! (is-eq caller assignee) ERR_NOT_BID_OWNER)
+    (asserts! (is-eq (get status feature-data) "assigned") ERR_FEATURE_COMPLETED)
+    
+    (try! (as-contract (stx-transfer? bounty-amount tx-sender caller)))
+    
+    (map-set feature-requests feature-id (merge feature-data {
+        status: "completed"
+    }))
+    
+    (ok bounty-amount)
+    )
+)
+
+(define-public (cancel-feature-request (feature-id uint))
+    (let (
+        (caller tx-sender)
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (requester (get requester feature-data))
+        (bounty-amount (get bounty feature-data))
+        (current-status (get status feature-data))
+    )
+    (asserts! (is-eq caller requester) ERR_NOT_FEATURE_OWNER)
+    (asserts! (is-eq current-status "open") ERR_FEATURE_ACTIVE)
+    
+    (try! (as-contract (stx-transfer? bounty-amount tx-sender caller)))
+    
+    (map-set feature-requests feature-id (merge feature-data {
+        status: "cancelled"
+    }))
+    
+    (ok bounty-amount)
+    )
+)
+
+(define-public (withdraw-bid (bid-id uint))
+    (let (
+        (caller tx-sender)
+        (bid-data (unwrap! (map-get? feature-bids bid-id) ERR_BID_NOT_FOUND))
+        (feature-id (get feature-id bid-data))
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (bidder (get bidder bid-data))
+        (bidder-key {feature-id: feature-id, bidder: caller})
+        (current-bids (default-to (list) (map-get? user-feature-bids caller)))
+        (updated-bids (filter is-not-bid-id current-bids))
+    )
+    (asserts! (is-eq caller bidder) ERR_NOT_BID_OWNER)
+    (asserts! (is-eq (get status bid-data) "pending") ERR_FEATURE_COMPLETED)
+    (asserts! (is-eq (get status feature-data) "open") ERR_FEATURE_COMPLETED)
+    
+    (map-set feature-bids bid-id (merge bid-data {
+        status: "withdrawn"
+    }))
+    
+    (map-delete feature-bidders bidder-key)
+    (map-set user-feature-bids caller updated-bids)
+    
+    (ok true)
+    )
+)
+
+(define-public (rate-completed-feature (feature-id uint) (rating uint))
+    (let (
+        (caller tx-sender)
+        (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+        (requester (get requester feature-data))
+    )
+    (asserts! (is-eq caller requester) ERR_NOT_FEATURE_OWNER)
+    (asserts! (is-eq (get status feature-data) "completed") ERR_FEATURE_ACTIVE)
+    (asserts! (>= rating u1) ERR_INVALID_AMOUNT)
+    (asserts! (<= rating u5) ERR_INVALID_AMOUNT)
+    
+    (ok rating)
+    )
+)
+
 (define-read-only (get-member-info (member principal))
     (map-get? members member)
 )
@@ -458,6 +682,10 @@
 
 (define-private (is-not-stake-id (stake-id uint))
     (not (is-eq stake-id stake-id))
+)
+
+(define-private (is-not-bid-id (bid-id uint))
+    (not (is-eq bid-id bid-id))
 )
 
 (define-private (calculate-total-rewards-for-user (user principal))
@@ -559,3 +787,86 @@
     })
     )
 )
+
+;; Feature Marketplace Read-Only Functions
+
+(define-read-only (get-feature-request (feature-id uint))
+    (map-get? feature-requests feature-id)
+)
+
+(define-read-only (get-feature-bid (bid-id uint))
+    (map-get? feature-bids bid-id)
+)
+
+(define-read-only (get-feature-bids (feature-id uint))
+    (map-get? feature-bid-list feature-id)
+)
+
+(define-read-only (get-user-feature-bids (user principal))
+    (map-get? user-feature-bids user)
+)
+
+(define-read-only (get-feature-count)
+    (ok (var-get feature-counter))
+)
+
+(define-read-only (get-bid-count)
+    (ok (var-get bid-counter))
+)
+
+(define-read-only (get-feature-status (feature-id uint))
+    (match (map-get? feature-requests feature-id)
+        feature-data (let (
+            (current-block stacks-block-height)
+            (deadline-passed (>= current-block (get deadline feature-data)))
+            (status (get status feature-data))
+            (bid-count (len (default-to (list) (map-get? feature-bid-list feature-id))))
+        )
+        (ok {
+            status: status,
+            deadline-passed: deadline-passed,
+            bid-count: bid-count,
+            bounty: (get bounty feature-data),
+            priority: (get priority feature-data)
+        }))
+        ERR_FEATURE_NOT_FOUND
+    )
+)
+
+(define-read-only (get-marketplace-stats)
+    (let (
+        (total-features (var-get feature-counter))
+        (total-bids (var-get bid-counter))
+    )
+    (ok {
+        total-features: total-features,
+        total-bids: total-bids,
+        active-features: u0,
+        completed-features: u0
+    })
+    )
+)
+
+(define-read-only (calculate-bid-score (bid-id uint))
+    (match (map-get? feature-bids bid-id)
+        bid-data (let (
+            (bid-amount (get amount bid-data))
+            (timeline (get timeline bid-data))
+            (feature-id (get feature-id bid-data))
+            (feature-data (unwrap! (map-get? feature-requests feature-id) ERR_FEATURE_NOT_FOUND))
+            (bounty (get bounty feature-data))
+            (savings (- bounty bid-amount))
+            (efficiency-score (if (> timeline u0) (/ savings timeline) u0))
+        )
+        (ok {
+            savings: savings,
+            timeline: timeline,
+            efficiency-score: efficiency-score,
+            bid-amount: bid-amount
+        }))
+        ERR_BID_NOT_FOUND
+    )
+)
+
+
+
